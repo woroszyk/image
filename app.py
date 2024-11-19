@@ -1,10 +1,6 @@
 from flask import Flask, render_template, request, jsonify, send_file
 import requests
 from bs4 import BeautifulSoup
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
-from webdriver_manager.chrome import ChromeDriverManager
 from PIL import Image
 import io
 import os
@@ -13,11 +9,9 @@ import base64
 import tempfile
 import zipfile
 import time
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.common.by import By
-from selenium.common.exceptions import TimeoutException
 from io import BytesIO
+import asyncio
+from pyppeteer import launch
 
 app = Flask(__name__)
 
@@ -26,15 +20,12 @@ def get_image_info(img_url):
         response = requests.get(img_url, timeout=10, verify=False)
         response.raise_for_status()
         
-        # Sprawdź typ MIME
         content_type = response.headers.get('content-type', '').lower()
         if not any(img_type in content_type for img_type in ['image/', 'application/octet-stream']):
             return None
             
-        # Pobierz rozmiar
         size = len(response.content)
         
-        # Otwórz obraz za pomocą PIL
         img = Image.open(BytesIO(response.content))
         format = img.format
         width, height = img.size
@@ -46,114 +37,70 @@ def get_image_info(img_url):
             'width': width,
             'height': height
         }
-    except (requests.RequestException, Image.UnidentifiedImageError, Exception) as e:
+    except Exception as e:
         print(f"Błąd podczas przetwarzania obrazu {img_url}: {str(e)}")
         return None
 
-def process_images(url):
-    chrome_options = Options()
-    chrome_options.add_argument('--headless')
-    chrome_options.add_argument('--no-sandbox')
-    chrome_options.add_argument('--disable-dev-shm-usage')
-    chrome_options.binary_location = '/usr/bin/google-chrome'
+async def process_images_async(url):
+    browser = await launch(
+        handleSIGINT=False,
+        handleSIGTERM=False,
+        handleSIGHUP=False,
+        args=['--no-sandbox']
+    )
     
-    driver = None
     try:
-        driver = webdriver.Chrome(options=chrome_options)
-        driver.set_page_load_timeout(30)
+        page = await browser.newPage()
+        await page.setViewport({'width': 1920, 'height': 1080})
+        await page.goto(url, {'waitUntil': 'networkidle0', 'timeout': 30000})
         
-        # Dodaj obsługę cookies dla Allegro
-        if 'allegro.pl' in url:
-            driver.get('https://allegro.pl')
-            time.sleep(2)
-            try:
-                cookie_button = driver.find_element(By.ID, 'opbox-gdpr-consents-modal').find_element(By.XPATH, './/button[contains(text(), "akceptuję")]')
-                cookie_button.click()
-                time.sleep(1)
-            except Exception as e:
-                print(f"Nie udało się zaakceptować cookies: {str(e)}")
-        
-        # Ładujemy stronę
-        driver.get(url)
-        time.sleep(3)
-        
-        # Przewijamy stronę kilka razy
-        for _ in range(3):
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(1)
-        driver.execute_script("window.scrollTo(0, 0);")
-        
-        # Zbieramy wszystkie obrazy
-        img_elements = driver.find_elements(By.TAG_NAME, 'img')
-        img_urls = set()  # Używamy set() zamiast listy, aby uniknąć duplikatów
-        
-        def normalize_url(url):
-            if not url or url.startswith('data:'):
-                return None
-            if not url.startswith(('http://', 'https://')):
-                base_url = '{uri.scheme}://{uri.netloc}'.format(uri=urlparse(url))
-                url = urljoin(base_url, url)
-            return url.split('?')[0]  # Usuwamy parametry URL
+        # Pobierz wszystkie tagi img
+        img_elements = await page.querySelectorAll('img')
+        img_urls = []
         
         for img in img_elements:
             try:
-                # Sprawdzamy różne atrybuty obrazu
-                src = img.get_attribute('src')
-                data_src = img.get_attribute('data-src')
-                data_original = img.get_attribute('data-original')
-                srcset = img.get_attribute('srcset')
-                
-                if src:
-                    normalized_url = normalize_url(src)
-                    if normalized_url:
-                        img_urls.add(normalized_url)
-                        
-                if data_src:
-                    normalized_url = normalize_url(data_src)
-                    if normalized_url:
-                        img_urls.add(normalized_url)
-                        
-                if data_original:
-                    normalized_url = normalize_url(data_original)
-                    if normalized_url:
-                        img_urls.add(normalized_url)
-                
-                # Obsługa srcset
-                if srcset:
-                    for srcset_url in srcset.split(','):
-                        parts = srcset_url.strip().split(' ')
-                        if parts:
-                            normalized_url = normalize_url(parts[0])
-                            if normalized_url:
-                                img_urls.add(normalized_url)
-                        
+                src = await page.evaluate('(element) => element.src', img)
+                if src and src.startswith('http'):
+                    img_urls.append(src)
             except Exception as e:
-                print(f"Błąd podczas przetwarzania elementu img: {str(e)}")
+                print(f"Błąd podczas pobierania URL obrazu: {str(e)}")
+                continue
+        
+        # Pobierz tagi style i background-image
+        elements_with_bg = await page.querySelectorAll('*')
+        for element in elements_with_bg:
+            try:
+                style = await page.evaluate('''(element) => {
+                    const style = window.getComputedStyle(element);
+                    return style.backgroundImage;
+                }''', element)
+                
+                if style and style.startswith('url('):
+                    url_match = style[4:-1].strip('"\'')
+                    if url_match.startswith('http'):
+                        img_urls.append(url_match)
+            except Exception as e:
+                print(f"Błąd podczas pobierania tła: {str(e)}")
                 continue
     
-    except Exception as e:
-        print(f"Błąd podczas przetwarzania strony: {str(e)}")
-        return []
-        
     finally:
-        if driver:
-            try:
-                driver.quit()
-            except Exception as e:
-                print(f"Błąd podczas zamykania przeglądarki: {str(e)}")
+        await browser.close()
     
-    # Przetwarzamy znalezione URL-e
-    results = []
+    # Usuń duplikaty
+    img_urls = list(set(img_urls))
+    
+    # Pobierz informacje o obrazach
+    images_info = []
     for img_url in img_urls:
-        try:
-            result = get_image_info(img_url)
-            if result:
-                results.append(result)
-        except Exception as e:
-            print(f"Błąd podczas przetwarzania URL-a {img_url}: {str(e)}")
-            continue
+        info = get_image_info(img_url)
+        if info:
+            images_info.append(info)
     
-    return results
+    return images_info
+
+def process_images(url):
+    return asyncio.get_event_loop().run_until_complete(process_images_async(url))
 
 @app.route('/')
 def index():
@@ -161,120 +108,62 @@ def index():
 
 @app.route('/analyze', methods=['POST'])
 def analyze():
-    url = request.json.get('url')
+    url = request.form.get('url')
     if not url:
-        return jsonify({'error': 'URL is required'}), 400
+        return jsonify({'error': 'No URL provided'}), 400
     
     try:
-        results = process_images(url)
-        return jsonify({
-            'images': results,
-            'count': len(results)
-        })
+        images = process_images(url)
+        return jsonify({'images': images})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 @app.route('/download', methods=['POST'])
 def download():
     try:
-        images = request.json.get('images', [])
-        format_type = request.json.get('format', 'original')
-        
-        if not images:
-            return jsonify({'error': 'Nie wybrano żadnych obrazów'}), 400
-            
-        if len(images) == 1:
-            # Pobieranie pojedynczego obrazu
-            img_url = images[0]
-            try:
-                response = requests.get(img_url, timeout=10)
-                if response.status_code == 200:
-                    img = Image.open(BytesIO(response.content))
-                    output = BytesIO()
-                    
-                    if format_type == 'original':
-                        # Zachowaj oryginalny format
-                        img.save(output, format=img.format)
-                        extension = img.format.lower()
-                    else:
-                        # Konwertuj do wybranego formatu
-                        if img.mode in ('RGBA', 'LA'):
-                            # Konwertuj obrazy z kanałem alpha do RGB
-                            background = Image.new('RGB', img.size, (255, 255, 255))
-                            if img.mode == 'RGBA':
-                                background.paste(img, mask=img.split()[3])
-                            else:
-                                background.paste(img, mask=img.split()[1])
-                            img = background
-                        else:
-                            img = img.convert('RGB')
-                        
-                        if format_type.lower() == 'jpg':
-                            extension = 'jpg'
-                            img.save(output, format='JPEG', quality=95)
-                        else:
-                            extension = format_type.lower()
-                            img.save(output, format=format_type.upper())
-                        
-                    output.seek(0)
-                    return send_file(
-                        output,
-                        as_attachment=True,
-                        download_name=f'obraz.{extension}',
-                        mimetype=f'image/{extension}'
-                    )
-            except Exception as e:
-                return jsonify({'error': f'Błąd podczas pobierania obrazu: {str(e)}'}), 500
-        else:
-            # Pobieranie wielu obrazów jako ZIP
-            temp_dir = tempfile.mkdtemp()
-            zip_path = os.path.join(temp_dir, 'obrazy.zip')
-            
+        selected_images = request.json.get('selectedImages', [])
+        if not selected_images:
+            return jsonify({'error': 'No images selected'}), 400
+
+        # Utwórz tymczasowy katalog
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Utwórz plik ZIP
+            zip_path = os.path.join(temp_dir, 'images.zip')
             with zipfile.ZipFile(zip_path, 'w') as zip_file:
-                for i, img_url in enumerate(images):
+                for idx, img_url in enumerate(selected_images):
                     try:
-                        response = requests.get(img_url, timeout=10)
-                        if response.status_code == 200:
-                            img = Image.open(BytesIO(response.content))
-                            img_output = BytesIO()
-                            
-                            if format_type == 'original':
-                                # Zachowaj oryginalny format
-                                img.save(img_output, format=img.format)
-                                extension = img.format.lower()
-                            else:
-                                # Konwertuj do wybranego formatu
-                                if img.mode in ('RGBA', 'LA'):
-                                    background = Image.new('RGB', img.size, (255, 255, 255))
-                                    if img.mode == 'RGBA':
-                                        background.paste(img, mask=img.split()[3])
-                                    else:
-                                        background.paste(img, mask=img.split()[1])
-                                    img = background
-                                else:
-                                    img = img.convert('RGB')
-                                
-                                if format_type.lower() == 'jpg':
-                                    extension = 'jpg'
-                                    img.save(img_output, format='JPEG', quality=95)
-                                else:
-                                    extension = format_type.lower()
-                                    img.save(img_output, format=format_type.upper())
-                                
-                            img_output.seek(0)
-                            zip_file.writestr(f'obraz_{i+1}.{extension}', img_output.getvalue())
+                        # Pobierz obraz
+                        response = requests.get(img_url, verify=False)
+                        response.raise_for_status()
+                        
+                        # Określ rozszerzenie pliku
+                        content_type = response.headers.get('content-type', '')
+                        ext = '.jpg'  # domyślne rozszerzenie
+                        if 'png' in content_type.lower():
+                            ext = '.png'
+                        elif 'gif' in content_type.lower():
+                            ext = '.gif'
+                        elif 'jpeg' in content_type.lower() or 'jpg' in content_type.lower():
+                            ext = '.jpg'
+                        
+                        # Zapisz obraz do ZIP
+                        filename = f'image_{idx + 1}{ext}'
+                        zip_file.writestr(filename, response.content)
+                        
                     except Exception as e:
-                        print(f"Błąd podczas przetwarzania obrazu {img_url}: {str(e)}")
+                        print(f"Błąd podczas pobierania obrazu {img_url}: {str(e)}")
                         continue
-            
+
+            # Wyślij plik ZIP
             return send_file(
                 zip_path,
+                mimetype='application/zip',
                 as_attachment=True,
-                download_name='obrazy.zip',
-                mimetype='application/zip'
+                download_name='images.zip'
             )
+
     except Exception as e:
-        return jsonify({'error': f'Błąd podczas przetwarzania: {str(e)}'}), 500
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
     app.run(debug=True)
