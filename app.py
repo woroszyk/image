@@ -42,21 +42,32 @@ def get_image_info(img_url):
         return None
 
 async def process_images_async(url):
-    browser = await launch(
-        handleSIGINT=False,
-        handleSIGTERM=False,
-        handleSIGHUP=False,
-        args=['--no-sandbox']
-    )
-    
+    print(f"Starting process_images_async for URL: {url}")
+    browser = None
     try:
+        browser = await launch(
+            handleSIGINT=False,
+            handleSIGTERM=False,
+            handleSIGHUP=False,
+            args=[
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--single-process'
+            ]
+        )
+        print("Browser launched successfully")
+        
         page = await browser.newPage()
         await page.setViewport({'width': 1920, 'height': 1080})
+        print(f"Navigating to URL: {url}")
         await page.goto(url, {'waitUntil': 'networkidle0', 'timeout': 30000})
+        print("Page loaded successfully")
         
         # Pobierz wszystkie tagi img
         img_elements = await page.querySelectorAll('img')
         img_urls = []
+        print(f"Found {len(img_elements)} img elements")
         
         for img in img_elements:
             try:
@@ -64,11 +75,13 @@ async def process_images_async(url):
                 if src and src.startswith('http'):
                     img_urls.append(src)
             except Exception as e:
-                print(f"Błąd podczas pobierania URL obrazu: {str(e)}")
+                print(f"Error getting image URL: {str(e)}")
                 continue
         
         # Pobierz tagi style i background-image
         elements_with_bg = await page.querySelectorAll('*')
+        print(f"Checking {len(elements_with_bg)} elements for background images")
+        
         for element in elements_with_bg:
             try:
                 style = await page.evaluate('''(element) => {
@@ -81,14 +94,24 @@ async def process_images_async(url):
                     if url_match.startswith('http'):
                         img_urls.append(url_match)
             except Exception as e:
-                print(f"Błąd podczas pobierania tła: {str(e)}")
+                print(f"Error getting background image: {str(e)}")
                 continue
     
+    except Exception as e:
+        print(f"Major error in process_images_async: {str(e)}")
+        raise e
+    
     finally:
-        await browser.close()
+        if browser:
+            try:
+                await browser.close()
+                print("Browser closed successfully")
+            except Exception as e:
+                print(f"Error closing browser: {str(e)}")
     
     # Usuń duplikaty
     img_urls = list(set(img_urls))
+    print(f"Found {len(img_urls)} unique image URLs")
     
     # Pobierz informacje o obrazach
     images_info = []
@@ -97,6 +120,7 @@ async def process_images_async(url):
         if info:
             images_info.append(info)
     
+    print(f"Successfully processed {len(images_info)} images")
     return images_info
 
 def process_images(url):
@@ -113,9 +137,12 @@ def analyze():
         return jsonify({'error': 'URL is required'}), 400
     
     try:
+        print(f"Starting analysis for URL: {url}")
         images = process_images(url)
+        print(f"Analysis completed successfully with {len(images)} images")
         return jsonify({'images': images})
     except Exception as e:
+        print(f"Error in analyze endpoint: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/download', methods=['POST'])
